@@ -779,6 +779,62 @@ export function ensureHarnessHome(path: string): { ok: boolean; error?: string }
   }
 }
 
+function ensureClaudeGlobalPermissions(home: string): void {
+  try {
+    const dir = join(home, '.claude');
+    const p = join(dir, 'settings.json');
+    let settings: Record<string, unknown> = {};
+    if (existsSync(p)) {
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+        settings = parsed as Record<string, unknown>;
+      } catch {
+        // Existing user-owned state is unreadable or malformed. Never replace it
+        // with a generated minimal config.
+        return;
+      }
+    }
+    if (
+      settings.skipDangerousModePermissionPrompt !== true ||
+      settings.skipAutoPermissionPrompt !== true
+    ) {
+      settings.skipDangerousModePermissionPrompt = true;
+      settings.skipAutoPermissionPrompt = true;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(p, JSON.stringify(settings, null, 2), 'utf8');
+    }
+  } catch { /* best-effort; never block a spawn */ }
+}
+
+type ClaudeConfig = Record<string, unknown> & {
+  projects?: Record<string, Record<string, unknown> & { hasTrustDialogAccepted?: boolean }>;
+};
+
+function ensureClaudeProjectTrust(home: string, cwd: string): void {
+  try {
+    const p = join(home, '.claude.json');
+    let config: ClaudeConfig = {};
+    if (existsSync(p)) {
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+        config = parsed as ClaudeConfig;
+      } catch {
+        // Fail closed for this file while leaving the global settings helper free
+        // to complete its independent best-effort mutation.
+        return;
+      }
+    }
+    const currentProject = config.projects?.[cwd];
+    if (currentProject?.hasTrustDialogAccepted !== true) {
+      config.projects = config.projects ?? {};
+      config.projects[cwd] = { ...currentProject, hasTrustDialogAccepted: true };
+      writeFileSync(p, JSON.stringify(config, null, 2), 'utf8');
+    }
+  } catch { /* best-effort; never block a spawn */ }
+}
+
 /** Idempotently pre-accept Claude Code's first-run prompts so agents spawned with
  *  `--permission-mode bypassPermissions` start cleanly. Without this, a fresh
  *  install shows an interactive "WARNING: Bypass Permissions mode … 1. No, exit /
@@ -794,34 +850,6 @@ export function ensureHarnessHome(path: string): { ok: boolean; error?: string }
 export function ensureClaudePermissionsAccepted(cwd?: string): void {
   const home = homedir();
   if (!home) return;
-  // 1) Global bypass-mode warning gate.
-  try {
-    const dir = join(home, '.claude');
-    const p = join(dir, 'settings.json');
-    let s: Record<string, unknown> = {};
-    if (existsSync(p)) {
-      try { s = JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>; } catch { s = {}; }
-    }
-    if (s.skipDangerousModePermissionPrompt !== true || s.skipAutoPermissionPrompt !== true) {
-      s.skipDangerousModePermissionPrompt = true;
-      s.skipAutoPermissionPrompt = true;
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(p, JSON.stringify(s, null, 2), 'utf8');
-    }
-  } catch { /* best-effort; never block a spawn */ }
-  // 2) Per-folder trust dialog gate (only when this cwd isn't already trusted).
-  if (cwd) {
-    try {
-      const p = join(home, '.claude.json');
-      let c: { projects?: Record<string, { hasTrustDialogAccepted?: boolean }> } = {};
-      if (existsSync(p)) {
-        try { c = JSON.parse(readFileSync(p, 'utf8')); } catch { c = {}; }
-      }
-      if (c.projects?.[cwd]?.hasTrustDialogAccepted !== true) {
-        c.projects = c.projects ?? {};
-        c.projects[cwd] = { ...(c.projects[cwd] ?? {}), hasTrustDialogAccepted: true };
-        writeFileSync(p, JSON.stringify(c, null, 2), 'utf8');
-      }
-    } catch { /* best-effort */ }
-  }
+  ensureClaudeGlobalPermissions(home);
+  if (cwd) ensureClaudeProjectTrust(home, cwd);
 }
