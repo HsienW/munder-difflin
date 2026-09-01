@@ -780,20 +780,14 @@ export function ensureHarnessHome(path: string): { ok: boolean; error?: string }
 }
 
 function ensureClaudeGlobalPermissions(home: string): void {
+  const dir = join(home, '.claude');
+  const p = join(dir, 'settings.json');
   try {
-    const dir = join(home, '.claude');
-    const p = join(dir, 'settings.json');
     let settings: Record<string, unknown> = {};
     if (existsSync(p)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-        settings = parsed as Record<string, unknown>;
-      } catch {
-        // Existing user-owned state is unreadable or malformed. Never replace it
-        // with a generated minimal config.
-        return;
-      }
+      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      settings = parsed as Record<string, unknown>;
     }
     if (
       settings.skipDangerousModePermissionPrompt !== true ||
@@ -804,7 +798,12 @@ function ensureClaudeGlobalPermissions(home: string): void {
       mkdirSync(dir, { recursive: true });
       writeFileSync(p, JSON.stringify(settings, null, 2), 'utf8');
     }
-  } catch { /* best-effort; never block a spawn */ }
+  } catch (error) {
+    console.warn(
+      `[config] Could not safely update Claude config at ${p}:`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
 }
 
 type ClaudeConfig = Record<string, unknown> & {
@@ -812,19 +811,13 @@ type ClaudeConfig = Record<string, unknown> & {
 };
 
 function ensureClaudeProjectTrust(home: string, cwd: string): void {
+  const p = join(home, '.claude.json');
   try {
-    const p = join(home, '.claude.json');
     let config: ClaudeConfig = {};
     if (existsSync(p)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-        config = parsed as ClaudeConfig;
-      } catch {
-        // Fail closed for this file while leaving the global settings helper free
-        // to complete its independent best-effort mutation.
-        return;
-      }
+      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      config = parsed as ClaudeConfig;
     }
     const currentProject = config.projects?.[cwd];
     if (currentProject?.hasTrustDialogAccepted !== true) {
@@ -832,7 +825,12 @@ function ensureClaudeProjectTrust(home: string, cwd: string): void {
       config.projects[cwd] = { ...currentProject, hasTrustDialogAccepted: true };
       writeFileSync(p, JSON.stringify(config, null, 2), 'utf8');
     }
-  } catch { /* best-effort; never block a spawn */ }
+  } catch (error) {
+    console.warn(
+      `[config] Could not safely update Claude config at ${p}:`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
 }
 
 /** Idempotently pre-accept Claude Code's first-run prompts so agents spawned with

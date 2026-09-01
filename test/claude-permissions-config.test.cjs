@@ -34,6 +34,18 @@ const settingsPath = path.join(home, '.claude', 'settings.json');
 const projectPath = path.join(home, '.claude.json');
 const cwd = path.join(home, 'project');
 
+function captureWarnings(run) {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.map(String).join(' '));
+  try {
+    run();
+  } finally {
+    console.warn = originalWarn;
+  }
+  return warnings;
+}
+
 test.beforeEach(() => {
   fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
   fs.rmSync(projectPath, { recursive: true, force: true });
@@ -54,9 +66,10 @@ test('malformed settings are preserved while valid project trust still updates',
     projects: { other: { hasTrustDialogAccepted: false, note: 'keep' } }
   }, null, 2), 'utf8');
 
-  ensureClaudePermissionsAccepted(cwd);
+  const warnings = captureWarnings(() => ensureClaudePermissionsAccepted(cwd));
 
   assert.equal(fs.readFileSync(settingsPath, 'utf8'), original);
+  assert.ok(warnings.some((line) => line.includes(settingsPath)));
   const project = JSON.parse(fs.readFileSync(projectPath, 'utf8'));
   assert.equal(project.theme, 'dark');
   assert.deepEqual(project.projects.other, { hasTrustDialogAccepted: false, note: 'keep' });
@@ -69,13 +82,14 @@ test('malformed project config is preserved while valid settings still update', 
   fs.writeFileSync(settingsPath, JSON.stringify({ env: { CUSTOM_VALUE: 'preserve-me' } }), 'utf8');
   fs.writeFileSync(projectPath, original, 'utf8');
 
-  ensureClaudePermissionsAccepted(cwd);
+  const warnings = captureWarnings(() => ensureClaudePermissionsAccepted(cwd));
 
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.deepEqual(settings.env, { CUSTOM_VALUE: 'preserve-me' });
   assert.equal(settings.skipDangerousModePermissionPrompt, true);
   assert.equal(settings.skipAutoPermissionPrompt, true);
   assert.equal(fs.readFileSync(projectPath, 'utf8'), original);
+  assert.ok(warnings.some((line) => line.includes(projectPath)));
 });
 
 test('valid configs preserve unrelated top-level and project fields', () => {
@@ -136,9 +150,10 @@ test('existing read failures are isolated per config path', () => {
   fs.mkdirSync(settingsPath, { recursive: true });
   fs.writeFileSync(projectPath, JSON.stringify({ projects: {} }), 'utf8');
 
-  ensureClaudePermissionsAccepted(cwd);
+  const settingsWarnings = captureWarnings(() => ensureClaudePermissionsAccepted(cwd));
 
   assert.equal(fs.statSync(settingsPath).isDirectory(), true);
+  assert.ok(settingsWarnings.some((line) => line.includes(settingsPath)));
   assert.equal(
     JSON.parse(fs.readFileSync(projectPath, 'utf8')).projects[cwd].hasTrustDialogAccepted,
     true
@@ -150,13 +165,14 @@ test('existing read failures are isolated per config path', () => {
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify({ env: { KEEP: 'yes' } }), 'utf8');
 
-  ensureClaudePermissionsAccepted(cwd);
+  const projectWarnings = captureWarnings(() => ensureClaudePermissionsAccepted(cwd));
 
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   assert.deepEqual(settings.env, { KEEP: 'yes' });
   assert.equal(settings.skipDangerousModePermissionPrompt, true);
   assert.equal(settings.skipAutoPermissionPrompt, true);
   assert.equal(fs.statSync(projectPath).isDirectory(), true);
+  assert.ok(projectWarnings.some((line) => line.includes(projectPath)));
 });
 
 test('repeated execution is idempotent once required fields are present', () => {
