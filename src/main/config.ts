@@ -780,19 +780,14 @@ export function ensureHarnessHome(path: string): { ok: boolean; error?: string }
 }
 
 function ensureClaudeGlobalPermissions(home: string): void {
+  const dir = join(home, '.claude');
+  const p = join(dir, 'settings.json');
   try {
-    const dir = join(home, '.claude');
-    const p = join(dir, 'settings.json');
     let s: Record<string, unknown> = {};
     if (existsSync(p)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-        s = parsed as Record<string, unknown>;
-      } catch {
-        // Existing unreadable or malformed user config is not safe to mutate.
-        return;
-      }
+      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      s = parsed as Record<string, unknown>;
     }
     if (s.skipDangerousModePermissionPrompt !== true || s.skipAutoPermissionPrompt !== true) {
       s.skipDangerousModePermissionPrompt = true;
@@ -800,32 +795,37 @@ function ensureClaudeGlobalPermissions(home: string): void {
       mkdirSync(dir, { recursive: true });
       writeFileSync(p, JSON.stringify(s, null, 2), 'utf8');
     }
-  } catch { /* best-effort; never block a spawn */ }
+  } catch (error) {
+    console.warn(
+      `[config] Could not safely update Claude config at ${p}:`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 type ClaudeProjectConfig = Record<string, unknown> & { hasTrustDialogAccepted?: boolean };
 type ClaudeConfig = Record<string, unknown> & { projects?: Record<string, ClaudeProjectConfig> };
 
 function ensureClaudeProjectTrust(home: string, cwd: string): void {
+  const p = join(home, '.claude.json');
   try {
-    const p = join(home, '.claude.json');
     let c: ClaudeConfig = {};
     if (existsSync(p)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
-        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-        c = parsed as ClaudeConfig;
-      } catch {
-        // Existing unreadable or malformed user config is not safe to mutate.
-        return;
-      }
+      const parsed: unknown = JSON.parse(readFileSync(p, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+      c = parsed as ClaudeConfig;
     }
     if (c.projects?.[cwd]?.hasTrustDialogAccepted !== true) {
       c.projects = c.projects ?? {};
       c.projects[cwd] = { ...(c.projects[cwd] ?? {}), hasTrustDialogAccepted: true };
       writeFileSync(p, JSON.stringify(c, null, 2), 'utf8');
     }
-  } catch { /* best-effort; never block a spawn */ }
+  } catch (error) {
+    console.warn(
+      `[config] Could not safely update Claude config at ${p}:`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 /** Idempotently pre-accept Claude Code's first-run prompts so agents spawned with

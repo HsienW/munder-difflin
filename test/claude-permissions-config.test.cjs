@@ -54,13 +54,24 @@ test.after(() => {
 test('preserves malformed Claude config files byte-for-byte', () => {
   const malformedSettings = '{\n  "env": {\n    "CUSTOM_VALUE": "preserve-me"\n  },\n';
   const malformedProjectConfig = '{\n  "projects": {\n';
+  const warnings = [];
+  const originalWarn = console.warn;
   writeSettings(malformedSettings);
   fs.writeFileSync(projectConfigPath, malformedProjectConfig, 'utf8');
 
-  ensureClaudePermissionsAccepted(cwd);
+  console.warn = (...args) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    ensureClaudePermissionsAccepted(cwd);
+  } finally {
+    console.warn = originalWarn;
+  }
 
   assert.equal(fs.readFileSync(settingsPath, 'utf8'), malformedSettings);
   assert.equal(fs.readFileSync(projectConfigPath, 'utf8'), malformedProjectConfig);
+  assert.ok(warnings.some((line) => line.includes(settingsPath)));
+  assert.ok(warnings.some((line) => line.includes(projectConfigPath)));
 });
 
 test('merges required fields into valid configs without losing unrelated data', () => {
