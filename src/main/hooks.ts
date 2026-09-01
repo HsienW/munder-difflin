@@ -89,18 +89,29 @@ export class HookServer {
 
     this.server = createServer((conn) => {
       let pending = Buffer.alloc(0);
+      const rejectOversizedFrame = (bytes: number): void => {
+        this.hive.appendLog({
+          kind: 'hook-frame-rejected',
+          reason: 'frame-too-large',
+          bytes,
+          limit: MAX_HOOK_FRAME_BYTES,
+        });
+        conn.destroy();
+      };
       conn.on('data', (chunk) => {
         pending = Buffer.concat([pending, chunk]);
         const nl = pending.indexOf(0x0a);
         if (nl === -1) {
-          if (pending.length > MAX_HOOK_FRAME_BYTES) conn.destroy();
+          if (pending.length > MAX_HOOK_FRAME_BYTES) rejectOversizedFrame(pending.length);
           return; // wait for the full line
         }
         // The byte limit covers the JSON payload and excludes its newline.
         if (nl > MAX_HOOK_FRAME_BYTES) {
-          conn.destroy();
+          rejectOversizedFrame(nl);
           return;
         }
+        // Hook shims send one newline-delimited request per connection and stop writing.
+        // conn.end() below closes the connection after that single frame is handled.
         const frame = pending.subarray(0, nl).toString('utf8');
         let payload: HookPayload = {};
         try { payload = JSON.parse(frame); } catch { /* ignore */ }

@@ -34,7 +34,11 @@ async function openServer(t) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'md-hooks-frame-'));
   const sock = socketPath(base);
   const routed = [];
-  const hive = { sockPath: () => sock };
+  const logs = [];
+  const hive = {
+    sockPath: () => sock,
+    appendLog: (entry) => logs.push(entry)
+  };
   const server = new HookServer(hive, () => null, () => ({ notifications: false }));
 
   // Exercise the real net.Server framing path while isolating these tests from
@@ -52,7 +56,7 @@ async function openServer(t) {
     server.stop();
     fs.rmSync(base, { recursive: true, force: true });
   });
-  return { sock, routed };
+  return { sock, routed, logs };
 }
 
 async function sendChunks(sock, chunks, pauseMs = 0, timeoutMs = 1000) {
@@ -135,13 +139,19 @@ test('ordinary fragmented frame retains existing one-request behavior', async (t
 });
 
 test('oversized incomplete frame is rejected without routing a payload', async (t) => {
-  const { sock, routed } = await openServer(t);
+  const { sock, routed, logs } = await openServer(t);
 
   const result = await sendChunks(sock, [Buffer.alloc(MAX_HOOK_FRAME_BYTES + 1, 0x78)], 0, 400);
 
   assert.equal(result.didClose, true, 'server retained an oversized incomplete frame');
   assert.deepEqual(routed, []);
   assert.equal(result.response, '');
+  assert.deepEqual(logs, [{
+    kind: 'hook-frame-rejected',
+    reason: 'frame-too-large',
+    bytes: MAX_HOOK_FRAME_BYTES + 1,
+    limit: MAX_HOOK_FRAME_BYTES
+  }]);
 });
 
 test('payload exactly at the byte limit is accepted', async (t) => {
@@ -157,7 +167,7 @@ test('payload exactly at the byte limit is accepted', async (t) => {
 });
 
 test('payload one byte above the limit is rejected', async (t) => {
-  const { sock, routed } = await openServer(t);
+  const { sock, routed, logs } = await openServer(t);
   const frame = framedPayloadWithByteLength(MAX_HOOK_FRAME_BYTES + 1);
 
   const result = await sendChunks(sock, [frame]);
@@ -165,4 +175,10 @@ test('payload one byte above the limit is rejected', async (t) => {
   assert.equal(result.didClose, true);
   assert.deepEqual(routed, []);
   assert.equal(result.response, '');
+  assert.deepEqual(logs, [{
+    kind: 'hook-frame-rejected',
+    reason: 'frame-too-large',
+    bytes: MAX_HOOK_FRAME_BYTES + 1,
+    limit: MAX_HOOK_FRAME_BYTES
+  }]);
 });
