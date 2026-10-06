@@ -20,7 +20,7 @@
  */
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
-  readdirSync, statSync, lstatSync, realpathSync, rmSync, appendFileSync,
+  readdirSync, statSync, lstatSync, realpathSync, rmSync,
   symlinkSync, unlinkSync, copyFileSync, cpSync, chmodSync
 } from 'node:fs';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -43,6 +43,10 @@ import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
 import { resolveGodName } from '../shared/godIdentity';
+import { JsonlAppendFile } from './jsonlAppendFile';
+
+export const HIVE_LOG_FILE_NAME = 'log.jsonl';
+export const HIVE_COST_LEDGER_FILE_NAME = 'cost-ledger.jsonl';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -397,6 +401,9 @@ export class HiveManager {
   ) {}
 
   private routerTimer: NodeJS.Timeout | null = null;
+  private readonly logAppendFile = new JsonlAppendFile();
+  private readonly costLedgerAppendFile = new JsonlAppendFile();
+  private _lastLogAppendAt = 0;
 
   /** The embedded OTLP collector's loopback URL, set by the main process once the
    *  collector is bound (telemetry.ts). null = telemetry off → no OTel env is
@@ -643,7 +650,7 @@ export class HiveManager {
     }
     const tasks = join(root, 'tasks.json');
     if (!existsSync(tasks)) this.writeJson(tasks, { tasks: [] });
-    const log = join(root, 'log.jsonl');
+    const log = join(root, HIVE_LOG_FILE_NAME);
     if (!existsSync(log)) writeFileSync(log, '', 'utf8');
 
     // Keep the churny/ephemeral live files out of the hive git repo.
@@ -653,7 +660,7 @@ export class HiveManager {
     // can include tokens, paths and prompt fragments, and the hive repo is
     // committed on every change — a secret written there would be permanent.
     // log.jsonl gets the structured, non-sensitive fields; the dump stays local.
-    const want = ['fleet.json', 'hooks.sock', 'cost-ledger.jsonl', 'crashes/', '.DS_Store'];
+    const want = ['fleet.json', 'hooks.sock', HIVE_COST_LEDGER_FILE_NAME, 'crashes/', '.DS_Store'];
     let lines: string[] = [];
     if (existsSync(gitignore)) { try { lines = readFileSync(gitignore, 'utf8').split('\n'); } catch { lines = []; } }
     const missing = want.filter((w) => !lines.includes(w));
@@ -2662,8 +2669,8 @@ export class HiveManager {
   }
   logTail(n = 200): unknown[] {
     const root = this.root();
-    if (!root || !existsSync(join(root, 'log.jsonl'))) return [];
-    const lines = readFileSync(join(root, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    if (!root || !existsSync(join(root, HIVE_LOG_FILE_NAME))) return [];
+    const lines = readFileSync(join(root, HIVE_LOG_FILE_NAME), 'utf8').trim().split('\n').filter(Boolean);
     return lines.slice(-n).map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
   }
 
@@ -2748,10 +2755,19 @@ export class HiveManager {
 
   // — log —
   appendLog(event: Record<string, unknown>): void {
-    const root = this.root();
-    if (!root) return;
-    const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
-    try { appendFileSync(join(root, 'log.jsonl'), line, 'utf8'); } catch { /* noop */ }
+    try {
+      const root = this.root();
+      if (!root) return;
+      const line = JSON.stringify({ ts: Date.now(), ...event }) + '\n';
+      if (this.logAppendFile.append(join(root, HIVE_LOG_FILE_NAME), line)) {
+        this._lastLogAppendAt = Date.now();
+      }
+    } catch { /* best-effort event log */ }
+  }
+
+  /** Current-process log activity, independent of filesystem mtime visibility. */
+  lastLogAppendAt(): number {
+    return this._lastLogAppendAt;
   }
 
   /**
@@ -2771,23 +2787,33 @@ export class HiveManager {
    * next natural commit. Best-effort — never throws into the beat.
    */
   appendCostLedger(sample: AgentUsageSample): void {
-    const root = this.root();
-    if (!root) return;
-    // Fully snake_case so the row maps 1:1 onto Kevin's (#4) cost_ledger SQLite
-    // columns (agent_id, session_id, ts, input, output, cache_read,
-    // cache_creation, model, usd) — migration is a straight INSERT…SELECT.
-    const row = {
-      agent_id: sample.agentId,
-      session_id: sample.sessionId,
-      ts: sample.ts,
-      input: sample.input,
-      output: sample.output,
-      cache_read: sample.cacheRead,
-      cache_creation: sample.cacheCreation,
-      model: sample.model,
-      usd: sample.usd
-    };
-    try { appendFileSync(join(root, 'cost-ledger.jsonl'), JSON.stringify(row) + '\n', 'utf8'); } catch { /* noop */ }
+    try {
+      const root = this.root();
+      if (!root) return;
+      // Fully snake_case so the row maps 1:1 onto Kevin's (#4) cost_ledger SQLite
+      // columns (agent_id, session_id, ts, input, output, cache_read,
+      // cache_creation, model, usd) — migration is a straight INSERT…SELECT.
+      const row = {
+        agent_id: sample.agentId,
+        session_id: sample.sessionId,
+        ts: sample.ts,
+        input: sample.input,
+        output: sample.output,
+        cache_read: sample.cacheRead,
+        cache_creation: sample.cacheCreation,
+        model: sample.model,
+        usd: sample.usd
+      };
+      this.costLedgerAppendFile.append(
+        join(root, HIVE_COST_LEDGER_FILE_NAME), JSON.stringify(row) + '\n'
+      );
+    } catch { /* best-effort cost ledger */ }
+  }
+
+  /** Release root-owned append handles before quit, reset, or a home switch. */
+  closeAppendFiles(): void {
+    this.logAppendFile.close();
+    this.costLedgerAppendFile.close();
   }
 
   // — json + atomic io —
@@ -2851,9 +2877,9 @@ export class HiveManager {
     this.untrackedCostLedger = true;
     // Probe before mutating: `rm --cached` on a repo that never tracked it
     // would still rewrite the index on every launch, inside the retry path.
-    const tracked = this.git(['ls-files', '--', 'cost-ledger.jsonl'], root);
+    const tracked = this.git(['ls-files', '--', HIVE_COST_LEDGER_FILE_NAME], root);
     if (!tracked.ok || !tracked.out.trim()) return;
-    this.git(['rm', '--cached', '-q', '--ignore-unmatch', '--', 'cost-ledger.jsonl'], root);
+    this.git(['rm', '--cached', '-q', '--ignore-unmatch', '--', HIVE_COST_LEDGER_FILE_NAME], root);
     console.warn('[hive] untracked the cost ledger from the hive repo');
   }
 
