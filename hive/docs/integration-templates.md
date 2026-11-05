@@ -14,10 +14,16 @@ template: base URL, auth model, and the high-value endpoints.
 A template is a preset that seeds an `IntegrationRecord`. Its fields (per spec §5):
 
 - **`kind`** — `'github' | 'custom-rest'`. Every first-wave tool here is `custom-rest`.
-- **`baseUrl`** — API origin (+ base path). The broker forwards `<baseUrl>/<path>`,
-  where `<path>` is supplied by the worker per call (the endpoint catalog below is
-  reference, not part of the type). Site-specific tools ship an editable placeholder
-  host (`your-domain.atlassian.net`) the user replaces.
+- **`baseUrl`** — API origin (+ base path). Without a worker path component, the
+  broker preserves the exact base pathname, including an explicit trailing slash;
+  query-only calls append the query without adding a slash. A non-empty worker path
+  joins beneath the base as a directory prefix (`<baseUrl>/<path>`). The endpoint
+  catalog below is reference, not part of the type. Site-specific tools ship an
+  editable placeholder host (`your-domain.atlassian.net`) the user replaces.
+  The router treats `/i/<id>` and `/i/<id>/` as the same empty worker path. This
+  intentionally changes empty-path calls to bases such as Sentry's `/api/0` from
+  `/api/0/` to `/api/0`; if the upstream requires `/api/0/`, configure that trailing
+  slash in `baseUrl`. Linear's `/graphql` remains `/graphql` without a child path.
 - **`authType`** — how the broker injects the credential: `none`, `bearer`
   (`Authorization: Bearer <secret>`), `header` (`<authHeader>: <secret>` verbatim), or
   `github` (bearer + GitHub headers). **No template carries a secret** — only

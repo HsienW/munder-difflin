@@ -8,6 +8,10 @@
  * authorizes the integration, decrypts the integration's real secret, injects it as the
  * upstream auth header, forwards to the integration's baseUrl, and streams the response
  * back. The worker uses the integration WITHOUT EVER SEEING the credential.
+ * With no worker path, the configured base pathname is an exact endpoint, including
+ * its explicit trailing slash. Non-empty paths join beneath it as a directory.
+ * `/i/<id>` and `/i/<id>/` both mean an empty path; endpoints requiring a trailing
+ * slash must include that slash in baseUrl.
  *
  * Generalizes the existing src/main/slack.ts `SlackReplyServer` (a loopback broker that
  * posts Slack replies without the agent seeing the bot token) to an N-integration proxy.

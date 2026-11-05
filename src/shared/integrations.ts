@@ -41,8 +41,10 @@ export interface IntegrationRecord {
   label: string;
   /** Preset family — drives default headers and UI affordances. */
   kind: IntegrationKind;
-  /** https origin (+ optional base path). The broker forwards <baseUrl>/<path>. A
-   *  loopback http origin is allowed only for explicit local custom-rest targets. */
+  /** https origin (+ optional base path). With no worker path, preserve the exact
+   *  base pathname, including an explicit trailing slash; otherwise join beneath it
+   *  as a directory. A loopback http origin is allowed only for explicit local
+   *  custom-rest targets. */
   baseUrl: string;
   /** How the broker injects auth when forwarding upstream. */
   authType: IntegrationAuthType;
@@ -200,6 +202,11 @@ export function buildAuthHeaders(
  * under the baseUrl origin (NOT an open proxy). Returns null if the path would
  * escape the origin (absolute URL, host override, or traversal above the base path).
  * `pathAndQuery` is the part after `/i/<integrationId>/` including any query string.
+ * With no path component, preserve the exact base pathname (also for query-only
+ * calls). Non-empty paths use directory-style joining. The broker router treats
+ * `/i/<id>` and `/i/<id>/` as the same empty path: if an endpoint requires a trailing
+ * slash, configure it in baseUrl. In particular, `/api/0` now stays `/api/0` rather
+ * than becoming `/api/0/` on an empty-path request.
  */
 export function resolveUpstreamUrl(baseUrl: string, pathAndQuery: string): URL | null {
   let base: URL;
@@ -217,8 +224,10 @@ export function resolveUpstreamUrl(baseUrl: string, pathAndQuery: string): URL |
   try { decodedPath = decodeURIComponent(pathOnly); } catch { return null; }
   if (decodedPath.split('/').some((seg) => seg === '..')) return null;
 
-  // Normalize the base path to a directory prefix, then append the worker path.
-  const basePath = base.pathname.endsWith('/') ? base.pathname : base.pathname + '/';
+  // Only a non-empty worker path treats the base as a directory. Share that
+  // directory boundary with confinement below; empty paths preserve the endpoint.
+  const baseDirectoryPath = base.pathname.endsWith('/') ? base.pathname : base.pathname + '/';
+  const basePath = pathOnly ? baseDirectoryPath : base.pathname;
   const rel = pathAndQuery.replace(/^\/+/, '');
   let resolved: URL;
   try {
@@ -228,8 +237,7 @@ export function resolveUpstreamUrl(baseUrl: string, pathAndQuery: string): URL |
   }
   // Confine: same origin AND the resolved path stays under the base path prefix.
   if (resolved.origin !== base.origin) return null;
-  const confinePrefix = base.pathname.endsWith('/') ? base.pathname : base.pathname + '/';
-  if (confinePrefix !== '/' && !(resolved.pathname + '/').startsWith(confinePrefix) && resolved.pathname !== base.pathname) {
+  if (baseDirectoryPath !== '/' && !(resolved.pathname + '/').startsWith(baseDirectoryPath) && resolved.pathname !== base.pathname) {
     return null;
   }
   return resolved;
