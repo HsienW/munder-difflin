@@ -13,7 +13,10 @@
  * loop lives alongside `memory.start()` — never a cron.
  *
  * Safety is layered so a bad LLM pass can NEVER lose data:
- *   backup-first (lossless cold copy) → verify-don't-trust gate → atomic swap.
+ *   backup-first (lossless cold copy) → verify-don't-trust gate → atomic swap
+ *   that only lands if memory.md still starts with the bytes that were condensed
+ *   (an agent's append made meanwhile is carried over verbatim; any other change
+ *   aborts).
  * If any check fails the original file is left byte-for-byte untouched and the
  * only side effect is a `condense-abort` log line. The miner re-indexes the new
  * file automatically on the next tick because its mtime changed (memory.ts).
@@ -22,7 +25,7 @@
  */
 import {
   existsSync, statSync, readdirSync, readFileSync, writeFileSync,
-  mkdirSync, copyFileSync, renameSync, openSync, fsyncSync, closeSync
+  mkdirSync, copyFileSync, renameSync, openSync, fsyncSync, closeSync, unlinkSync
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { runHiddenClaude } from './hiddenClaude';
@@ -172,15 +175,16 @@ export class MemoryReflector {
         const mem = join(agentsDir, id, 'memory.md');
         if (!existsSync(mem)) continue;
         let bytes = 0;
-        let text = '';
+        let snapshot = Buffer.alloc(0);
         try {
           bytes = statSync(mem).size;
           // A manual single-agent call condenses on demand (skips the trigger);
           // the autonomous loop honors the threshold.
           if (!onlyId && !this.shouldCondense(bytes, mem, settings)) continue;
-          text = readFileSync(mem, 'utf8');
+          // Raw bytes, not decoded text: the swap compares against exactly these.
+          snapshot = readFileSync(mem);
         } catch { continue; }
-        results.push(await this.condense(home, id, mem, text, settings));
+        results.push(await this.condense(home, id, mem, snapshot, settings));
       }
     } finally {
       this.reflecting = false;
@@ -202,9 +206,16 @@ export class MemoryReflector {
   // — condense one file —
 
   private async condense(
-    home: string, id: string, mem: string, text: string, s: ReflectSettings
+    home: string, id: string, mem: string, snapshot: Buffer, s: ReflectSettings
   ): Promise<ReflectResult> {
-    const oldBytes = Buffer.byteLength(text, 'utf8');
+    const oldBytes = snapshot.length;
+    const text = snapshot.toString('utf8');
+    // Invalid UTF-8 decodes to U+FFFD; a rewrite built from that text would
+    // silently corrupt the file, so refuse before spending an LLM call.
+    if (!Buffer.from(text, 'utf8').equals(snapshot)) {
+      this.logAbort(id, 'source-encoding-invalid', undefined, { oldBytes });
+      return { id, condensed: false, reason: 'source-encoding-invalid', oldBytes };
+    }
     const parsed = parseMemory(text);
     // Split recent into KEEP (newest K, verbatim) and EVICT (older — summarized).
     const keepCount = Math.max(1, s.recentKeep);
@@ -250,18 +261,22 @@ export class MemoryReflector {
       return { id, condensed: false, reason: verdict.reason, oldBytes, newBytes };
     }
 
-    // 5) ATOMIC SWAP — write a temp sibling, fsync, rename over the original.
-    try {
-      atomicWrite(mem, rebuilt);
-    } catch (e) {
-      this.logAbort(id, 'swap-failed', String(e), { oldBytes, newBytes });
-      return { id, condensed: false, reason: 'swap-failed', oldBytes, newBytes };
+    // 5) ATOMIC SWAP — write a temp sibling, fsync, rename over the original, but
+    //    only over bytes we have seen. An agent may append while the summarize call
+    //    is pending: that tail is carried verbatim onto the rebuilt file. Any other
+    //    change means the rebuild is stale, so the pass aborts and the next tick
+    //    retries from the new contents.
+    const swap = atomicWriteIfUnchanged(mem, rebuilt, snapshot);
+    if (!swap.ok) {
+      this.logAbort(id, swap.reason, swap.detail, { oldBytes, newBytes });
+      return { id, condensed: false, reason: swap.reason, oldBytes, newBytes };
     }
 
     try {
       this.appendLog({
         kind: 'condense', agentId: id, oldBytes, newBytes,
-        evicted: evict.length, kept: keep.length, hoisted: summary.hoist.length, backup
+        evicted: evict.length, kept: keep.length, hoisted: summary.hoist.length, backup,
+        ...(swap.carriedBytes ? { carriedBytes: swap.carriedBytes } : {})
       });
     } catch { /* logging is best-effort */ }
     // The miner re-indexes within its next cycle — mtime changed, no extra wiring.
@@ -520,13 +535,87 @@ function utcStamp(): string {
   return new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 }
 
-/** Write `text` to `path` atomically: temp sibling → fsync → rename over target. */
-function atomicWrite(path: string, text: string): void {
+/** Why a guarded swap left the target alone. Stable strings — they surface as
+ *  `ReflectResult.reason` and in the `condense-abort` log line. */
+type SwapFailure = {
+  ok: false;
+  reason: 'source-changed' | 'source-check-failed' | 'swap-failed';
+  detail?: string;
+};
+
+/** How many times the swap re-checks a target that keeps growing before it gives
+ *  up and lets the next tick retry. Each round only copies the new tail bytes. */
+const MAX_CARRY_ROUNDS = 3;
+
+/** Write `text` to `path` atomically (temp sibling → fsync → rename over target),
+ *  but only over bytes the caller has seen. `path` must still start with exactly
+ *  `expected`. Bytes the agent appended after `expected` (memory.md is
+ *  append-mostly) are copied verbatim onto the end of the temp file and the
+ *  target is re-checked, until a check finds nothing new; any other change
+ *  aborts. Each re-read runs right before the rename with no await between them,
+ *  keeping the window as small as a synchronous check allows. This is an
+ *  optimistic check, NOT a cross-process compare-and-swap: a write landing
+ *  between the last re-read and the rename is still lost. A missing or
+ *  unreadable target fails closed, so the rename never recreates a file from a
+ *  stale snapshot. */
+function atomicWriteIfUnchanged(
+  path: string, text: string, expected: Buffer
+): { ok: true; carriedBytes: number } | SwapFailure {
   const tmp = `${path}.tmp-${Math.random().toString(36).slice(2, 10)}`;
-  writeFileSync(tmp, text, 'utf8');
+  let failure: SwapFailure;
   try {
-    const fd = openSync(tmp, 'r+');
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-  } catch { /* fsync best-effort; rename is the durability guarantee */ }
-  renameSync(tmp, path);
+    writeFileSync(tmp, text, 'utf8');
+    let carried = Buffer.alloc(0);
+    for (let round = 0; ; round++) {
+      try {
+        const fd = openSync(tmp, 'r+');
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      } catch { /* fsync best-effort; rename is the durability guarantee */ }
+      const check = checkSource(path, expected);
+      if (!check.ok) { failure = check; break; }
+      const { tail } = check;
+      // The tail may only grow: the bytes already copied must still be there as-is.
+      if (tail.length < carried.length || !tail.subarray(0, carried.length).equals(carried)) {
+        failure = { ok: false, reason: 'source-changed' };
+        break;
+      }
+      if (tail.length === carried.length) {
+        renameSync(tmp, path);
+        return { ok: true, carriedBytes: carried.length };
+      }
+      if (round >= MAX_CARRY_ROUNDS) {
+        failure = { ok: false, reason: 'source-changed', detail: 'still being appended' };
+        break;
+      }
+      writeFileSync(tmp, tail.subarray(carried.length), { flag: 'a' });
+      carried = Buffer.from(tail);
+    }
+  } catch (e) {
+    failure = { ok: false, reason: 'swap-failed', detail: String(e) };
+  }
+  // Remove only our own temp sibling — never the target. A cleanup error is
+  // appended to the detail so it cannot mask why the swap was refused.
+  try {
+    if (existsSync(tmp)) unlinkSync(tmp);
+  } catch (e) {
+    const cleanup = `temp cleanup failed: ${String(e)}`;
+    failure = { ...failure, detail: failure.detail ? `${failure.detail}; ${cleanup}` : cleanup };
+  }
+  return failure;
+}
+
+/** Check that the target's current raw bytes still start with the snapshot, and
+ *  return whatever follows it (empty when unchanged). Size or mtime alone would
+ *  miss an equal-length edit, so the full prefix is compared. */
+function checkSource(path: string, expected: Buffer): { ok: true; tail: Buffer } | SwapFailure {
+  let current: Buffer;
+  try {
+    current = readFileSync(path);
+  } catch (e) {
+    return { ok: false, reason: 'source-check-failed', detail: String(e) };
+  }
+  if (current.length < expected.length || !current.subarray(0, expected.length).equals(expected)) {
+    return { ok: false, reason: 'source-changed' };
+  }
+  return { ok: true, tail: current.subarray(expected.length) };
 }
